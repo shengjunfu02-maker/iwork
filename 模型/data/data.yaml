@@ -1,7 +1,11 @@
 # 比色管检测数据集配置（YOLO 格式，单类）
-# 路径相对于本文件所在目录解析（ultralytics 支持相对 path）
+#
+# ⚠️ path 是相对**仓库根目录**解析的（ultralytics 对相对 path 的解析依赖运行
+# 时的 CWD，2026-10-13 实测）——请按 README 约定在仓库根目录运行：
+#     python 模型/train.py --data 模型/data/data.yaml
+# train.py 内部还会把 path 固化成绝对路径，换任何 CWD 都不会失效。
 
-path: .            # 数据集根 = 模型/dataset
+path: 模型/dataset     # 数据集根
 train: images/train
 val: images/val
 

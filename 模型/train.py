@@ -29,9 +29,35 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+
+
+def resolve_data_yaml(data_arg):
+    """把数据 yaml 的 path 改写成绝对路径，返回临时 yaml 路径。
+
+    坑（2026-10-13 实测 ultralytics 8.4）: data.yaml 里的相对 path 是相对
+    **运行时的 CWD** 解析的（不存在时才落到 ~/datasets），换个目录启动训练就
+    找不到图片。这里按本脚本位置把 模型/dataset 固化成绝对路径，任何 CWD 下
+    都能训；train/val/names 等其余配置仍尊重用户 yaml。
+    """
+    import yaml  # ultralytics 依赖 pyyaml，环境里必有
+
+    with open(data_arg, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    ds_root = os.path.join(HERE, "dataset")          # 模型/dataset
+    if not os.path.isdir(ds_root):
+        p = cfg.get("path", "")                       # 兼容自带数据目录
+        cand = p if os.path.isabs(p) else os.path.join(ROOT, p)
+        if os.path.isdir(cand):
+            ds_root = cand
+    cfg["path"] = ds_root
+    tmp = os.path.join(tempfile.gettempdir(), "tubes_data_abs.yaml")
+    with open(tmp, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True)
+    return tmp
 
 
 def main():
@@ -57,9 +83,13 @@ def main():
         )
 
     from ultralytics import YOLO
+    data_abs = resolve_data_yaml(args.data)
+    import yaml as _yaml
+    with open(data_abs, encoding="utf-8") as _f:
+        print(f"数据集根(绝对路径): {_yaml.safe_load(_f)['path']}")
     model = YOLO(args.model)
     model.train(
-        data=args.data,
+        data=data_abs,
         epochs=args.epochs,
         imgsz=args.imgsz,
         batch=args.batch,
