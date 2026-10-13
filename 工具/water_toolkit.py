@@ -262,9 +262,42 @@ W_HV = {
 }
 NO_COLOR = {"pH": None, "氨氮": "0.20", "亚盐": "0.005"}   # 近无色按低档
 
+# ============== 2.5 照片锚点（外拍真值训练数据 · 2026-10-13 首批） ==============
+# 训练方法（用户规则）：持管外拍照 + 地面真值表（塘号→pH/氨氮/亚盐）→
+#   detect_tubes_v4（上方先验+垂直检查）→ crop_strip（裁掉多余背景）→
+#   sample_liquid_mode（整管选区众数取色）→ 按真值入表。
+# 与卡片锚点取并集参与最近邻+档间插值：外拍颜色被玻璃/光线洗淡
+# （S 系统性低于卡面），同档位外拍读数由照片锚点主导；卡片锚点保留，
+# 覆盖暂无照片训练的档位（pH 8.6/9.0、氨氮 5/8/15 等）。
+# 格式: (h, s, v, 读数值, 来源) —— hsv_to_value/_weighted_dist 只取前4列。
+ANCHORS_PHOTO = {
+    "pH": [
+        (0.4322, 0.3297, 0.7787, "7.20", "10:24 塘1"),
+        (0.3386, 0.3404, 0.7121, "7.20", "10:29 塘4"),
+        (0.2765, 0.4250, 0.7242, "7.40", "10:31 塘3"),
+    ],
+    "氨氮": [
+        (0.1290, 0.4466, 0.8576, "0.90", "10:24 塘1"),
+        (0.1100, 0.9069, 0.8619, "2", "10:29 塘4"),
+        (0.1626, 0.3300, 0.7183, "0.60", "10:31 塘3"),
+    ],
+    "亚盐": [
+        (0.8943, 0.2383, 0.8537, "0.010", "10:29 塘4"),
+        (0.9050, 0.3777, 0.7799, "0.050", "10:31 塘3"),
+    ],
+}
+
+
+def _anchors_all(base):
+    """卡片锚点 ∪ 照片锚点（同档位可多条，外拍真值训练所得）。"""
+    return ANCHORS[base] + ANCHORS_PHOTO.get(base, [])
+
 
 def hsv_to_value(param, hsv):
     """锚点换算（全 HSV 加权）。返回 (读数字符串, 备注)。
+
+    锚点集 = 标准比色卡锚点 ∪ 照片锚点（ANCHORS_PHOTO，外拍真值训练）。
+    外拍照片颜色洗淡，同档位通常先命中照片锚点；卡片锚点兜底未训练档位。
 
     两档行为（用户规则 2026-10-13 拍板）：
     - 胜负分明（次近距离 > INTERP_RATIO×最近距离）→ 取最近档；
@@ -279,14 +312,15 @@ def hsv_to_value(param, hsv):
             v0 = "2"
         return v0, "近无色"
     h, s, v = float(hsv[0]), float(hsv[1]), float(hsv[2])
-    anchors = ANCHORS[base]
+    anchors = _anchors_all(base)
     note = ""
     if base == "亚盐" and 0.80 <= h <= 0.88:
         note = "偏紫(背景干扰),按明度定档"
     wh, ws, wv = W_HV[base]
     best, bd = None, 1e9          # 最近档
     sec, sd = None, 1e9           # 次近档（档间插值用）
-    for ah, a_s, av, val in anchors:
+    for anc in anchors:           # 照片锚点为5元组，取前4列
+        ah, a_s, av, val = anc[0], anc[1], anc[2], anc[3]
         dh = min(abs(h - ah), 1 - abs(h - ah))
         d = (wh * dh) ** 2 + (ws * (s - a_s)) ** 2 + (wv * (v - av)) ** 2
         if d < bd:
@@ -581,3 +615,276 @@ def self_test():
 
 if __name__ == "__main__":
     self_test()
+
+
+# ============== 6. v4 现场模式（2026-10-13 用户指示+训练） ==============
+# 先验：比色管在整张图片上方；流程：上方先验检测 → 垂直度检查 → 截掉多余背景
+#       → 整管选区 → 每管取像素最多的颜色（RGB直方图众数）比色。
+# 与 v3 的差别：① 检测限图片上方先验区；② 色相族(绿=pH/粉=亚盐/黄=氨氮)列投影定管带，
+#   竖直边缘峰对补近无色管（液面线+肤色+管宽三重验证）；③ 取色不做色调族过滤/分区采样，
+#   整管选区内 RGB 量化(16级/bin)取最大 bin 的中位色；④ WB 校正健全性回退。
+TOP_PRIOR = 0.62        # 上方先验：只在前 62% 高度检测
+ANGLE_TOL = 12.0        # 垂直度容差（度），超出提示旋转重拍
+MODE_INNER = 0.16       # 整管选区两侧内缩比例（避管壁折射暗边）
+Y_PAD_TOP, Y_PAD_BOT = 6, 4   # 液柱段上下各避开的像素（液面线/管底）
+HUE_FAMILIES = {"pH": (0.25, 0.45, 0.15), "亚盐": (0.83, 0.97, 0.06), "氨氮": (0.10, 0.19, 0.25)}
+
+
+def load_rgb_safe(src):
+    """读图+WB校正；校正把颜色抹平(中位S跌破原值50%)时回退原图。"""
+    if isinstance(src, str):
+        raw = np.array(Image.open(src).convert("RGB")).astype(float)
+    else:
+        raw = src.astype(float)
+    s_raw = float(np.median(mcolors.rgb_to_hsv(raw / 255.)[:, :, 1]))
+    img, method = wb_correct(raw)
+    s_new = float(np.median(mcolors.rgb_to_hsv(img / 255.)[:, :, 1]))
+    if s_new < 0.5 * s_raw:
+        return raw, "raw(回退:%s)" % method
+    return img, method
+
+
+def detect_tubes_v4(src, top_prior=TOP_PRIOR):
+    """v4 管检测：上方先验 + 色相族/边缘双通道 + 误检过滤。
+    返回 (tubes, img, wb方法)；tube: a/b/cx/W/y1/y2/angle/vertical/family"""
+    img, wbm = load_rgb_safe(src)
+    hsv = mcolors.rgb_to_hsv(img / 255.)
+    hh, ww = hsv.shape[:2]
+    H, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    ytop = int(hh * top_prior)
+
+    # 通道1：色相族列投影 → 管带 + 液柱段
+    fam_bands = []
+    for fam, (h1, h2, s_thr) in HUE_FAMILIES.items():
+        mask = (H[:ytop] >= h1) & (H[:ytop] <= h2) & (S[:ytop] > s_thr)
+        if mask.sum() < 3000:
+            continue
+        col = _smooth(mask.mean(axis=0), 9)
+        thr = max(0.08, col.mean() + 1.5 * col.std())
+        runs, inrun = [], False
+        for x in range(ww):
+            if col[x] > thr and not inrun:
+                start = x; inrun = True
+            elif col[x] <= thr and inrun:
+                runs.append((start, x)); inrun = False
+        if inrun:
+            runs.append((start, ww))
+        for a, b in runs:
+            if not (60 < b - a < 800):
+                continue
+            hot = mask[:, a:b].mean(axis=1) > 0.4
+            best, cur, start, bstart = 0, 0, 0, 0
+            for y, v in enumerate(hot):
+                if v:
+                    if cur == 0:
+                        start = y
+                    cur += 1
+                    if cur > best:
+                        best, bstart = cur, start
+                else:
+                    cur = 0
+            if best > 60:
+                fam_bands.append({"a": a, "b": b, "family": fam,
+                                  "y1": bstart, "y2": bstart + best, "h": best})
+    # 族管液柱高度一致性（并排手持液柱对齐）
+    if fam_bands:
+        hm = float(np.median([t["h"] for t in fam_bands]))
+        fam_bands = [t for t in fam_bands if abs(t["h"] - hm) <= 0.5 * hm]
+
+    # 通道2：竖直边缘峰对 → 补近无色管
+    Ex = np.abs(V[:, 2:] - V[:, :-2]); Ex = np.pad(Ex, ((0, 0), (1, 1)))
+    proj = _smooth(Ex[:ytop].sum(axis=0), 15)
+    gy_all = np.abs(V[2:ytop] - V[:ytop - 2]).mean(axis=1)
+    thr_line = gy_all.mean() + 3.0 * gy_all.std()
+
+    def band_ok(a, b):
+        """边缘管候选：液面线(横跨带) + 肤色/指甲排除"""
+        band_v = hsv[:ytop, a + 12:b - 12, 2]
+        if band_v.shape[1] < 20:
+            return False
+        gy = np.abs(band_v[2:] - band_v[:-2]).mean(axis=1)
+        if float(gy.max()) > thr_line:
+            yp = int(gy.argmax())
+            line_row = np.abs(band_v[yp + 1] - band_v[yp - 1])
+            if float((line_row > 0.03).mean()) > 0.4:
+                seg = hsv[:ytop, a:b]
+                m = seg[:, :, 1] > 0.15
+                if m.sum() > 100:
+                    hs = seg[:, :, 0][m]
+                    if float(((hs <= 0.08) | (hs >= 0.95)).mean()) > 0.5:
+                        return False
+                return True
+        return False
+
+    tubes = list(fam_bands)
+    fam_w = [t["b"] - t["a"] for t in fam_bands]
+    Wm = float(np.median(fam_w)) if fam_w else 250.0
+
+    def edge_bands(thr_k, wtol):
+        """阈值系数 thr_k 找边缘峰对→候选管带（宽度容差 wtol、与已有管不重叠）。"""
+        thr = proj.mean() + thr_k * proj.std()
+        peaks = [x for x in range(10, ww - 10)
+                 if proj[x] > thr and proj[x] >= proj[max(0, x - 8):x + 9].max()]
+        merged = []
+        for p in peaks:
+            if merged and p - merged[-1] < 40:
+                if proj[p] > proj[merged[-1]]:
+                    merged[-1] = p
+            else:
+                merged.append(p)
+        out = []
+        for i in range(len(merged) - 1):
+            a, b = merged[i], merged[i + 1]
+            if not (60 < b - a < 800):
+                continue
+            if any(t["a"] < b and a < t["b"] for t in tubes):
+                continue
+            if abs((b - a) - Wm) > wtol * Wm:     # 管宽一致性
+                continue
+            if not band_ok(a, b):                  # 液面线+肤色排除
+                continue
+            out.append({"a": a, "b": b, "family": None, "y1": None, "y2": None})
+        return out
+
+    tubes += edge_bands(2.0, 0.45)
+    if len(tubes) < 3:
+        # 补检（2026-10-13 塘1实录）：近无色管（亚盐0）玻璃/液柱与背景无对比，
+        # 单侧管壁峰值低于常规阈值致峰对不完整→漏检。降阈值+放宽宽度容差补管，
+        # 仍须过液面线验证；仅当管数不足3（比色卡固定3管）时触发，防误检。
+        tubes += edge_bands(1.2, 0.60)
+
+    # 液柱段：族管共用最宽者；边缘管共用
+    yseg = None
+    for t in tubes:
+        if t["family"]:
+            w = t["y2"] - t["y1"]
+            if yseg is None or w > yseg[1] - yseg[0]:
+                yseg = (t["y1"], t["y2"])
+    if yseg is None:
+        yseg = (int(hh * 0.25), int(hh * 0.55))
+
+    out = []
+    for t in tubes:
+        a, b = t["a"], t["b"]
+        y1, y2 = (t["y1"], t["y2"]) if t["family"] else yseg
+        seg = S[y1:y2, a + 8:b - 8] > 0.10    # 垂直度：边界漂移→倾角
+        xs_l, xs_r, ys = [], [], []
+        for yy in range(0, seg.shape[0], max(1, seg.shape[0] // 12)):
+            idx = np.where(seg[yy])[0]
+            if len(idx) >= 2:
+                xs_l.append(idx[0]); xs_r.append(idx[-1]); ys.append(yy)
+        angle = 0.0
+        if len(ys) >= 4:
+            slope = (np.polyfit(ys, xs_l, 1)[0] + np.polyfit(ys, xs_r, 1)[0]) / 2
+            angle = float(np.degrees(np.arctan(slope)))
+        out.append({"a": a, "b": b, "cx": (a + b) / 2, "W": b - a, "y1": y1, "y2": y2,
+                    "angle": angle, "vertical": abs(angle) <= ANGLE_TOL, "family": t["family"]})
+    out.sort(key=lambda t: t["a"])
+    return out, img, wbm
+
+
+def crop_strip(img, tubes, pad=36):
+    """按管带裁剪掉多余背景，返回 (裁剪图uint8, (x1,y1,x2,y2))。"""
+    hh, ww = img.shape[:2]
+    a = min(t["a"] for t in tubes); b = max(t["b"] for t in tubes)
+    y1 = min(t["y1"] for t in tubes); y2 = max(t["y2"] for t in tubes)
+    x1, x2 = max(0, a - pad), min(ww, b + pad)
+    yy1, yy2 = max(0, y1 - Y_PAD_TOP - pad), min(hh, y2 + Y_PAD_BOT + pad)
+    return img[yy1:yy2, x1:x2].astype(np.uint8), (x1, yy1, x2, yy2)
+
+
+def sample_liquid_mode(img, tube):
+    """整管选区 + 众数颜色：RGB量化(16级/bin)取像素最多 bin 的中位色。
+    返回 (hsv 或 None, 状态, 众数占比%)。"""
+    a, b = tube["a"], tube["b"]; w = b - a
+    ix1, ix2 = int(a + MODE_INNER * w), int(b - MODE_INNER * w)
+    y1, y2 = tube["y1"] + Y_PAD_TOP, tube["y2"] - Y_PAD_BOT
+    crop = img[y1:y2, ix1:ix2]
+    if crop.size == 0:
+        return None, "选区为空", 0.0
+    flat = crop.reshape(-1, 3)
+    hsv = mcolors.rgb_to_hsv(flat / 255.)
+    med = np.median(hsv, axis=0)
+    if float(med[1]) < S_TRANSPARENT:
+        return None, "近无色(中位S=%.2f)" % float(med[1]), float(med[1])
+    q = (flat // 16).astype(int)
+    keys, counts = np.unique(q, axis=0, return_counts=True)
+    k = keys[counts.argmax()]
+    dom = flat[(q == k).all(axis=1)]
+    med_rgb = np.median(dom, axis=0)
+    return mcolors.rgb_to_hsv(med_rgb / 255.), "ok", 100.0 * counts.max() / len(flat)
+
+
+def infer_param(hsv_dom, tube):
+    """按众数色相判定指标（色相族为准，family 兜底）。"""
+    if hsv_dom is None:
+        return tube.get("family")
+    h = float(hsv_dom[0])
+    if 0.25 <= h <= 0.50:
+        return "pH"
+    if 0.83 <= h <= 0.97 or h <= 0.05:
+        return "亚盐"
+    if 0.05 < h < 0.25:
+        return "氨氮"
+    return tube.get("family")
+
+
+STD_ORDER = ["pH", "氨氮", "亚盐"]   # 比色卡标准管序（左→右），仅用于近无色管的指标推定
+
+
+def _assign_params_by_order(results):
+    """近无色管指标推定：管序先验（左pH中氨氮右亚盐）。
+
+    着色管已由色相定指标；近无色管无色相可依。规则：
+    - 未定指标管数 == 缺失指标数 == 1 → 唯一解，直接推定（无需管序）；
+    - 多个未定且共3管 → 按标准管序匹配，匹配不上再按剩余顺序填；
+    - 对不上（数量不符）→ 不猜，留空由人工复核。
+    """
+    unknown = [i for i, r in enumerate(results) if r["param"] is None]
+    if not unknown:
+        return
+    taken = {r["param"] for r in results if r["param"]}
+    missing = [p for p in STD_ORDER if p not in taken]
+    if len(unknown) != len(missing):
+        return
+    if len(missing) == 1:
+        results[unknown[0]]["param"] = missing[0]
+    elif len(results) == 3:
+        for i in unknown:
+            cand = STD_ORDER[i]
+            if cand in missing:
+                results[i]["param"] = cand
+                missing.remove(cand)
+        for i in unknown:                      # 管序非标准的残余：按剩余顺序填
+            if results[i]["param"] is None and missing:
+                results[i]["param"] = missing.pop(0)
+    for i in unknown:                          # 推定过的打标，便于人工复核
+        results[i]["note"] = (results[i].get("note", "") + "；近无色按管序推定指标").lstrip("；")
+
+
+def auto_read_photo_v4(fname, view="side"):
+    """v4 一键读数：上方先验检测→垂直检查→裁剪→整管众数比色。
+    返回 {"tubes":[...], "results":[{param,value,hsv,note}], "wb":..., "img":...}"""
+    tubes, img, wbm = detect_tubes_v4(fname)
+    results = []
+    for t in tubes:
+        hsv_dom, st, pct = sample_liquid_mode(img, t)
+        param = infer_param(hsv_dom, t)
+        if hsv_dom is None:
+            val = NO_COLOR.get(param) if param else None
+            note = st + "；按低档读"
+            results.append({"param": param, "value": val, "hsv": None,
+                            "note": note, "box": (t["a"], t["y1"], t["b"], t["y2"]),
+                            "angle": t["angle"], "vertical": t["vertical"]})
+        else:
+            val, vnote = hsv_to_value(param, hsv_dom)
+            results.append({"param": param, "value": val,
+                            "hsv": [float(hsv_dom[0]), float(hsv_dom[1]), float(hsv_dom[2])],
+                            "note": vnote + "；众数占%.0f%%" % pct,
+                            "box": (t["a"], t["y1"], t["b"], t["y2"]),
+                            "angle": t["angle"], "vertical": t["vertical"]})
+    _assign_params_by_order(results)
+    for r in results:                          # 推定指标后补读数（近无色→低档）
+        if r["param"] and r["value"] is None:
+            r["value"] = NO_COLOR.get(r["param"])
+    return {"tubes": tubes, "results": results, "wb": wbm, "img": img}
