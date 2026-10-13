@@ -1,0 +1,10 @@
+# 比色管检测数据集配置（YOLO 格式，单类）
+# 路径相对于本文件所在目录解析（ultralytics 支持相对 path）
+
+path: .            # 数据集根 = 模型/dataset
+train: images/train
+val: images/val
+
+# 类别
+names:
+  0: tube          # 比色管（整根：管口到管底可见部分；液柱颜色不定，含近无色管）
