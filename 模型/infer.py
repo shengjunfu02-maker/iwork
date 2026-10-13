@@ -46,6 +46,7 @@ _tk = {}
 exec(open(TOOLKIT, encoding="utf-8").read(), _tk)
 wb_correct = _tk["wb_correct"]
 bg_color = _tk["bg_color"]
+sample_liquid = _tk["sample_liquid"]
 hsv_to_value = _tk["hsv_to_value"]
 need_warn = _tk["need_warn"]
 ANCHORS = _tk["ANCHORS"]
@@ -79,45 +80,48 @@ def decide_param(hsv):
     return min(dists, key=dists.get)
 
 
-def liquid_segment_and_color(img, box, param):
-    """在检测框内定位液柱段并取代表色。
+def probe_color(img, box, bg=None):
+    """指标探测：框内宽松取液柱代表色（排除背景相近像素与暗部，不做色调族过滤）。
 
-    img: WB 校正后的 RGB 数组; box: (x1,y1,x2,y2)
-    返回 (hsv 或 None, 备注)。近无色返回 (None, "近无色")。
+    用于在不知道是哪根管时先判定指标；正式读数随后由 sample_liquid 按指标过滤重采。
+    返回 hsv 或 None（框内基本近无色/全暗/全是背景）。
     """
     x1, y1, x2, y2 = [int(v) for v in box]
     crop = img[y1:y2, x1:x2].reshape(-1, 3)
     if crop.size == 0:
-        return None, "空框"
+        return None
     hsv = mcolors.rgb_to_hsv(crop / 255.)
-    H, W = hsv.shape[0], 1  # crop 已拉平
-    hsv2d = hsv.reshape(y2 - y1, x2 - x1, 3)
-    # 液柱段：逐行饱和度中位数 > 0.20 的最长连续行段（避开管口空气段与管底）
-    row_s = np.median(hsv2d[:, :, 1], axis=1)
-    hot = row_s > 0.20
-    best, cur, start, bstart = 0, 0, 0, 0
-    for y, v in enumerate(hot):
-        if v:
-            if cur == 0:
-                start = y
-            cur += 1
-            if cur > best:
-                best, bstart = cur, start
-        else:
-            cur = 0
-    if best < 10:
-        return None, "框内无液柱段(全框近无色)"
-    seg = hsv2d[bstart:bstart + best].reshape(-1, 3)
-    # 色调族过滤后取主色档（与 water_toolkit.sample_liquid 同口径）
-    mask = seg[:, 1] > 0.10
-    if mask.sum() < 30:
-        return None, "近无色"
-    sel = seg[mask]
-    q = (sel // 12).astype(int)
+    m = (hsv[:, 1] > 0.10) & (hsv[:, 2] > 0.25)   # 有色且非暗部
+    if bg is not None:
+        # 排除与背景融为一体的像素（近无色管的框内主要是背景）
+        dh = np.minimum(np.abs(hsv[:, 0] - bg[0]), 1 - np.abs(hsv[:, 0] - bg[0])) * 360
+        m &= ~((np.abs(hsv[:, 1] - bg[1]) < 0.05) & (dh < 30))
+    if m.sum() < 30:
+        return None
+    sel = hsv[m]
+    q = (sel // 10).astype(int)
     keys, counts = np.unique(q, axis=0, return_counts=True)
     dom = sel[(q == keys[counts.argmax()]).all(axis=1)]
-    med = np.median(dom, axis=0)
-    return mcolors.rgb_to_hsv(med / 255.), ""
+    return np.median(dom, axis=0)
+
+
+def plausible_box(box, img_w, img_h):
+    """框合理性过滤：比色管在侧拍照中应是"一根管"的尺寸。
+
+    实测坑（2026-10-13 rot_1）：预训练权重会把画面上部大片背景/手持物
+    误检成横跨 ~98% 画宽的大框，把"近无色管按管序推定指标"的序号挤乱，
+    导致中管氨氮被推成亚盐后遭真亚盐管覆盖而丢失。
+    判定：宽 > 70% 画宽 或 面积 > 45% 画幅 → 判误检剔除。
+    """
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    if w <= 0 or h <= 0:
+        return False
+    if w > 0.70 * img_w:
+        return False
+    if (w * h) > 0.45 * (img_w * img_h):
+        return False
+    return True
 
 
 def infer_photo(fname, weights, view="side"):
@@ -131,7 +135,9 @@ def infer_photo(fname, weights, view="side"):
     model = YOLO(w)
 
     img = np.array(Image.open(fname).convert("RGB")).astype(float)
+    img_h, img_w = img.shape[:2]
     img_wb, wbok = wb_correct(img)
+    bg = bg_color(img_wb)
 
     r = model.predict(fname, conf=0.25, verbose=False)[0]
     out, meta = {}, []
@@ -139,22 +145,46 @@ def infer_photo(fname, weights, view="side"):
         return out, meta
 
     boxes = sorted([tuple(int(v) for v in b.xyxy[0]) for b in r.boxes], key=lambda b: b[0])
-    for box in boxes:
-        hsv, note = liquid_segment_and_color(img_wb, box, None)
-        if hsv is None:
-            meta.append({"box": box, "param": None, "note": note})
+    # 误检框过滤（横跨画幅的大框会把管序推定挤乱，见 plausible_box 注释）
+    kept = [b for b in boxes if plausible_box(b, img_w, img_h)]
+    dropped = [b for b in boxes if b not in kept]
+    for b in dropped:
+        meta.append({"box": b, "param": None, "note": "误检框已剔除(超画幅比例)"})
+    boxes = kept
+    n = len(boxes)
+    for idx, box in enumerate(boxes):
+        # ① 指标探测：宽松代表色（排除背景）→ 与三族锚点比距离定指标（不依赖管序）
+        probe = probe_color(img_wb, box, bg=bg)
+        param = decide_param(probe) if probe is not None else None
+        # ② 正式采样：复用 water_toolkit.sample_liquid（白平衡+色调族+主色档+透明判定）
+        #    探测不到指标时先不过滤采样，靠 sample_liquid 的透明判定兜底
+        smp = sample_liquid(img_wb, box, param, bg=bg)
+        if smp.get("transparent") or smp.get("hsv") is None:
+            # 近无色管没有颜色信息，只能按管序位置推定指标（中=氨氮、右=亚盐）
+            guess = None
+            if n >= 3:
+                guess = ["pH", "氨氮", "亚盐"][min(idx, 2)]
+            elif n == 2:
+                guess = ["氨氮", "亚盐"][min(idx, 1)]
+            else:
+                guess = "氨氮"
+            val, vnote = hsv_to_value(guess, None)
+            note = (vnote + ";" if vnote else "") + "近无色按管序推定指标"
+            if view == "top" and guess == "pH":
+                note += ";俯拍偏深约0.1-0.2"
+            out[guess] = {"value": val, "warn": need_warn(guess, val),
+                          "hsv": None, "note": note, "box": box}
+            meta.append({"box": box, "param": guess, "note": note})
             continue
-        param = decide_param(hsv)
         if param is None:
-            meta.append({"box": box, "param": None, "note": "指标判定失败"})
-            continue
-        val, vnote = hsv_to_value(param, hsv)
+            param = decide_param(smp["hsv"])
+        val, vnote = hsv_to_value(param, smp["hsv"])
         warn = need_warn(param, val)
         if view == "top" and param == "pH":
             vnote = (vnote + ";" if vnote else "") + "俯拍偏深约0.1-0.2"
         out[param] = {"value": val, "warn": warn,
-                      "hsv": tuple(np.round(hsv, 3)), "note": vnote, "box": box}
-        meta.append({"box": box, "param": param, "note": vnote or note})
+                      "hsv": tuple(np.round(smp["hsv"], 3)), "note": vnote, "box": box}
+        meta.append({"box": box, "param": param, "note": vnote})
     return out, meta
 
 
