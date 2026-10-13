@@ -1,0 +1,5 @@
+ultralytics>=8.4
+torch>=2.0
+Pillow
+numpy
+matplotlib
