@@ -33,12 +33,13 @@ YOLO **不直接吐读数**。本目录是两段式管线的第一段：
 模型/
 ├── README.md          ← 本文件
 ├── infer.py           ← 推理：照片 → 读数初判（YOLO 检测 + water_toolkit 规则复用）
-├── train.py           ← 一键训练
+├── train.py           ← 一键训练（自动把 data.yaml 的 path 固化成绝对路径）
 ├── requirements.txt   ← 依赖
 ├── data/
-│   ├── data.yaml      ← 数据集配置（单类 tube）
+│   ├── data.yaml      ← 数据集配置（单类 tube；path 相对仓库根目录解析）
 │   └── 标注规范.md     ← 标注口径 + 覆盖矩阵 + 质检清单
 ├── dataset/           ← images/ + labels/（YOLO 格式），照片与标注入库处
+│   └── 照片清单.md     ← v0.1 清单：10 张/30 框的来源、真值、划分口径
 └── weights/           ← 训练产出权重（best.pt 复制到此，6MB 级可直接 git 管理）
 ```
 
@@ -52,9 +53,11 @@ python3 -m venv /tmp/yoloenv
 /tmp/yoloenv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
 /tmp/yoloenv/bin/pip install ultralytics
 
-# 2. 预训练权重手动下载（hf-mirror 源可达；jsdelivr 对该仓库 404；ghproxy 不通）
+# 2. 预训练权重（hf-mirror 源可达；jsdelivr 对该仓库 404；ghproxy 不通）
+#    仓库已随库分发 模型/weights/yolov8n.pt（6.5MB，AGPL-3.0，COCO 预训练），
+#    一般无需再下载；要刷新版本时：
 curl -L -o yolov8n.pt https://hf-mirror.com/Ultralytics/YOLOv8/resolve/main/yolov8n.pt
-# 训练: python 模型/train.py --model yolov8n.pt
+# 训练: python 模型/train.py --model 模型/weights/yolov8n.pt
 # 推理: python 模型/infer.py 照片 --weights 模型/weights/yolov8n.pt
 ```
 
@@ -94,18 +97,31 @@ curl -L -o yolov8n.pt https://hf-mirror.com/Ultralytics/YOLOv8/resolve/main/yolo
 → 学习门槛不高，**50–100 张覆盖到位的标注照即可产出可用 v1**；
 漏检集中在"绿背景前的绿管"与"近无色管"，标注时按 `data/标注规范.md` 的覆盖矩阵加权。
 
+## 四·补、训练冒烟测试（2026-10-13，10 张量级）
+
+数据集 v0.1 入库后跑了全链冒烟（`train.py` → `data.yaml` → 权重 → `infer.py` 回归）：
+
+- **流程全通**：100 epochs CPU 3 分钟；从非仓库根目录启动也正常（train.py 绝对路径兜底生效）；
+- **val 指标**（3 张 / 9 框）：mAP50 0.57、mAP50-95 0.35、R 0.44——找到的管精度高，
+  但漏检仍近半，与预训练权重相比无实质提升；
+- **回归 4 塘**：rot_1（train 内）3/3、rot_3（val）2/3、rot_0 2/3、rot_2 仍 0/3
+  （绿区撞色 + 淡粉误透明 + 中管漏检三个老问题一个没解决）；
+- **结论**：冒烟权重仅证明链路可用，**不作为生产权重入库**；预训练权重
+  `weights/yolov8n.pt`（hf-mirror 源，AGPL-3.0）作为 infer.py 的降级方案随库分发。
+  生产 v1 必须等覆盖矩阵补齐（见第五节待补项）。
+
 ## 五、当前状态与下一步
 
 - [x] 环境验证 + 预训练试跑（可行性成立）
 - [x] 目录/脚本/标注规范落库
 - [x] infer.py 端到端跑通 + 两个 bug 修复 + 今日 4 塘回归比对（见第四节）
-- [x] **照片锚点训练首批**（2026-10-13，3塘实拍+地面真值）：`ANCHORS_PHOTO` 落库
-  `工具/water_toolkit.py`，与卡片锚点并集参与读数；外拍洗淡导致的系统性偏低已修正，
-  3/3 塘回归与真值一致；同批实修近无色管漏检/指标推定/锚点同源生成三问题。
-  详见 `照片锚点训练报告_2026-10-13.md` 与 `data/照片锚点训练_2026-10-13.json`。
-- [ ] **待供片**：用户批量导历史塘头照（已入 3 张：20261013 罗豆猪场 塘1/3/4 带图+YOLO标注；塘2 待重发。目标 50-100 张：今天 4 塘、8月冯坡 3 张、更早照片）入 `dataset/images/`
-- [ ] 标注（模型目视生成 YOLO txt）+ train/val 划分
-- [ ] `python 模型/train.py` 训练 → 权重入 `weights/`
+- [x] **数据集 v0.1 入库**（2026-10-13）：10 张 / 30 框，模型目视逐张校准标注，
+      train 7 + val 3（按"同批不跨拆"分），清单见 `dataset/照片清单.md`；
+      顺带修复 data.yaml 路径 bug（相对 path 依赖 CWD）+ train.py 绝对路径兜底
+- [x] 训练冒烟测试通过（链路可用，指标见第四节补充；冒烟权重不入库）
+- [ ] **继续供片**：8月冯坡另 2 张需重发（附件签名过期）；按 `data/标注规范.md》
+      覆盖矩阵补黄色氨氮管、深粉亚盐管、俯拍/阴天变体，目标 50–100 张
+- [ ] 规模到位后正式训练 → 权重入 `weights/`
 - [ ] 微调权重下 infer.py 再回归 4 塘，重点考核 rot_2 三错（漏检/撞色/淡粉）；
       通过后更新 `工作流/01`，把"模型初判"写入测水流程第二步
 
