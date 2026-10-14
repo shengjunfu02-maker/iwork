@@ -401,10 +401,16 @@ def detect_tubes(src, expect=3):
     # 竖直边缘 → 列投影（只算上部 75%，避开底部水印/桌面）
     Ex = np.abs(V[:, 2:] - V[:, :-2])
     Ex = np.pad(Ex, ((0, 0), (1, 1)))
+    # 图缘防护：二次裁剪/缩略图的圆角黑边会在图像左右缘产生巨峰（实测394px
+    # 缩略图缘峰106，真管缘峰仅10），把 thr=mean+2std 抬到45淹死全部真峰。
+    # 边缘 2% 列投影置零——原图真管不会贴在2%边缘（实测最近管心x=312/1600）。
+    x_margin = max(5, int(ww * 0.02))
+    Ex[:, :x_margin] = 0.0
+    Ex[:, ww - x_margin:] = 0.0
     ytop = max(50, int(hh * 0.75))
     proj = _smooth(Ex[:ytop].sum(axis=0), 15)
     thr = proj.mean() + 2.0 * proj.std()
-    peaks = [x for x in range(10, ww - 10)
+    peaks = [x for x in range(x_margin, ww - x_margin)
              if proj[x] > thr and proj[x] >= proj[max(0, x - 8):x + 9].max()]
     merged = []
     for p in peaks:
@@ -447,9 +453,15 @@ def detect_tubes(src, expect=3):
     # 合并共享峰且两半都"有色"的相邻带：一根有色管被内部竖直结构峰
     # (液体纹路/管壁高光)劈成两半时还原为整管。靠水平线检出的近无色管
     # 不参与合并——那是独立的另一根管。
+    # ⚠️ 宽度门（2026-10-13 训练新增，防"三根全有色贴管被链式并成巨管"）：
+    # 单管劈半时两半各约半管宽、合并后≈单管宽；而相邻真管各自已是完整
+    # 管宽(≈带宽中位数)，一旦合并宽度≈2×中位——合并后宽度超过 1.4×中位
+    # 带宽即判定为链式并管，禁止合并（p1_0846 三管贴管实战回归守护）。
+    W_med = float(np.median([b - a for a, b in bands])) if bands else 0.0
     consolidated, cons_flag = [], []
     for (a, b), cf in zip(bands, colored_list):
-        if consolidated and consolidated[-1][1] == a and cons_flag[-1] and cf:
+        if (consolidated and consolidated[-1][1] == a and cons_flag[-1] and cf
+                and (b - consolidated[-1][0]) <= 1.4 * W_med):
             consolidated[-1] = (consolidated[-1][0], b)
         else:
             consolidated.append((a, b))
@@ -464,24 +476,45 @@ def detect_tubes(src, expect=3):
     else:
         P = int(1.5 * W)          # 同批管等宽并排，间隙≈半管宽
 
-    # 液柱段：检出带内 S>bg+0.08 的最长连续行段，取最宽者共用（并排管液柱对齐）
-    yband = None
-    for a, b in bands:
-        band = hsv[:, a + 20:b - 20, 1]
-        hot = np.median(band, axis=1) > bgS + 0.08
-        best, cur, start, bstart = 0, 0, 0, 0
-        for y, v in enumerate(hot):
-            if v:
-                if cur == 0:
-                    start = y
-                cur += 1
-                if cur > best:
-                    best, bstart = cur, start
+    # 液柱段：由带内水平线界定（液面线与管底线之间），取段内行饱和度中位
+    # 最高的相邻线对——液体段 S 高于空白玻璃段与水面背景段，借此自择正确段。
+    # 并排管液柱对齐，取各检出带结果的中位共用。
+    # ⚠️ 2026-10-13 训练修复（p1_0846 实战）：原"最长连续高饱和行段"会被水面
+    # 背景欺骗——水面 S 高且连续，液柱段误判为 923..2133 伸到画面底部，采样
+    # 全采到背景。水平线是玻璃管的结构特征（液面/管底），不受水面饱和度影响。
+    def _band_lines(gy, thr):
+        rows = np.where(gy > thr)[0]
+        if len(rows) == 0:
+            return []
+        clusters = []
+        for y in rows:
+            if clusters and y - clusters[-1][-1] <= 3:
+                clusters[-1].append(y)
             else:
-                cur = 0
-        if best > 40 and (yband is None or best > yband[1] - yband[0]):
-            yband = (bstart, bstart + best)
-    if yband is None:
+                clusters.append([y])
+        return [int(np.mean(c)) for c in clusters]
+
+    ys_list = []
+    for a, b in bands:
+        band_v = hsv[:ytop, a + 15:b - 15, 2]
+        gy = np.abs(band_v[2:] - band_v[:-2]).mean(axis=1)
+        lines = _band_lines(gy, thr_line)
+        band_s = hsv[:ytop, a + 20:b - 20, 1]
+        row_s = np.median(band_s, axis=1)
+        best_pair = None
+        for i in range(len(lines) - 1):
+            y1, y2 = lines[i], lines[i + 1]
+            if not (40 < y2 - y1 < 0.6 * hh):
+                continue
+            seg_s = float(np.median(row_s[y1:y2]))
+            if best_pair is None or seg_s > best_pair[0]:
+                best_pair = (seg_s, y1, y2)
+        ys_list.append((best_pair[1], best_pair[2]) if best_pair else None)
+    valid_ys = [p for p in ys_list if p]
+    if valid_ys:
+        yband = (int(np.median([p[0] for p in valid_ys])),
+                 int(np.median([p[1] for p in valid_ys])))
+    else:
         yband = (int(hh * 0.30), int(hh * 0.60))     # 退化：图像中上部
 
     # 补齐到 expect 根（沿检出管左右按 P 推算；越界即止）
@@ -526,8 +559,9 @@ def auto_read_photo(fname, view="side"):
         out[p] = {"value": val, "warn": need_warn(p, val),
                   "hsv": None if r["hsv"] is None else tuple(np.round(r["hsv"], 3)),
                   "n": r["n"], "note": note, "box": box}
-        meta.append({"param": p, "cx": cx, "W": W, "detected": t["detected"],
-                     "transparent": r["transparent"], "box": box})
+        meta.append({"param": p, "cx": cx, "W": W, "y1": y1, "y2": y2,
+                     "detected": t["detected"], "transparent": r["transparent"],
+                     "box": box})
     return out, meta
 
 
