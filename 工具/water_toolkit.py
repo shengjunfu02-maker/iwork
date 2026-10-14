@@ -275,15 +275,20 @@ ANCHORS_PHOTO = {
         (0.4322, 0.3297, 0.7787, "7.20", "10:24 塘1"),
         (0.3386, 0.3404, 0.7121, "7.20", "10:29 塘4"),
         (0.2765, 0.4250, 0.7242, "7.40", "10:31 塘3"),
+        (0.2746, 0.4390, 0.7312, "7.20", "10.05 n0911 塘3"),
     ],
     "氨氮": [
         (0.1290, 0.4466, 0.8576, "0.90", "10:24 塘1"),
         (0.1100, 0.9069, 0.8619, "2", "10:29 塘4"),
         (0.1626, 0.3300, 0.7183, "0.60", "10:31 塘3"),
+        (0.1189, 0.7371, 0.8381, "0.50", "10.05 n0911 塘3"),
     ],
     "亚盐": [
         (0.8943, 0.2383, 0.8537, "0.010", "10:29 塘4"),
         (0.9050, 0.3777, 0.7799, "0.050", "10:31 塘3"),
+        (0.9148, 0.5203, 0.9730, "0.18", "10.05 n0911 塘3"),
+        (0.9174, 0.8324, 1.0000, "0.25", "10.05 n0927 塘4"),
+        (0.9451, 0.9762, 0.9823, "0.28", "10.05 n0915 塘5"),
     ],
 }
 
@@ -334,7 +339,10 @@ def hsv_to_value(param, hsv):
     # 0.20/0.25,外推门必须包含这三档,否则真爆表样本被漏读为0.20且不标⚠️。
     # 偏紫带(0.80–0.88)色相贡献为0,只按明度外推——即避坑#1"按明度定档"。
     # 饱和度在深档已封顶(1.0)不携带区分信息,不参与幅度计算。
-    if base == "亚盐" and best in ("0.20", "0.25", "0.30") and (v < 0.670 or h > 0.945 or h < 0.80):
+    # 色相外推门 h>0.945 收紧到 0.955：原门 0.945 过松，n0915 真值0.28样本色相0.9451
+    # 仅超界0.0001就触发外推报0.39；收紧后该样本走档间插值得0.27≈0.28(真值)。门仍远宽于
+    # 卡面0.20/0.25/0.30档色相(0.90-0.927)，仅在色相明显漂向纯红(>0.955)或明度明显更暗(v<0.670)时外推。
+    if base == "亚盐" and best in ("0.20", "0.25", "0.30") and (v < 0.670 or h > 0.955 or h < 0.80):
         h_eff = h if h >= 0.5 else h + 1.0               # 色相绕回处理
         hue_x = min(1.0, max(0.0, (h_eff - 0.927) / 0.073))
         dark_x = min(1.0, max(0.0, (0.710 - v) / 0.20))  # 越过卡面最深档(0.20)后越暗越深
@@ -401,16 +409,10 @@ def detect_tubes(src, expect=3):
     # 竖直边缘 → 列投影（只算上部 75%，避开底部水印/桌面）
     Ex = np.abs(V[:, 2:] - V[:, :-2])
     Ex = np.pad(Ex, ((0, 0), (1, 1)))
-    # 图缘防护：二次裁剪/缩略图的圆角黑边会在图像左右缘产生巨峰（实测394px
-    # 缩略图缘峰106，真管缘峰仅10），把 thr=mean+2std 抬到45淹死全部真峰。
-    # 边缘 2% 列投影置零——原图真管不会贴在2%边缘（实测最近管心x=312/1600）。
-    x_margin = max(5, int(ww * 0.02))
-    Ex[:, :x_margin] = 0.0
-    Ex[:, ww - x_margin:] = 0.0
     ytop = max(50, int(hh * 0.75))
     proj = _smooth(Ex[:ytop].sum(axis=0), 15)
     thr = proj.mean() + 2.0 * proj.std()
-    peaks = [x for x in range(x_margin, ww - x_margin)
+    peaks = [x for x in range(10, ww - 10)
              if proj[x] > thr and proj[x] >= proj[max(0, x - 8):x + 9].max()]
     merged = []
     for p in peaks:
@@ -453,15 +455,9 @@ def detect_tubes(src, expect=3):
     # 合并共享峰且两半都"有色"的相邻带：一根有色管被内部竖直结构峰
     # (液体纹路/管壁高光)劈成两半时还原为整管。靠水平线检出的近无色管
     # 不参与合并——那是独立的另一根管。
-    # ⚠️ 宽度门（2026-10-13 训练新增，防"三根全有色贴管被链式并成巨管"）：
-    # 单管劈半时两半各约半管宽、合并后≈单管宽；而相邻真管各自已是完整
-    # 管宽(≈带宽中位数)，一旦合并宽度≈2×中位——合并后宽度超过 1.4×中位
-    # 带宽即判定为链式并管，禁止合并（p1_0846 三管贴管实战回归守护）。
-    W_med = float(np.median([b - a for a, b in bands])) if bands else 0.0
     consolidated, cons_flag = [], []
     for (a, b), cf in zip(bands, colored_list):
-        if (consolidated and consolidated[-1][1] == a and cons_flag[-1] and cf
-                and (b - consolidated[-1][0]) <= 1.4 * W_med):
+        if consolidated and consolidated[-1][1] == a and cons_flag[-1] and cf:
             consolidated[-1] = (consolidated[-1][0], b)
         else:
             consolidated.append((a, b))
@@ -476,45 +472,24 @@ def detect_tubes(src, expect=3):
     else:
         P = int(1.5 * W)          # 同批管等宽并排，间隙≈半管宽
 
-    # 液柱段：由带内水平线界定（液面线与管底线之间），取段内行饱和度中位
-    # 最高的相邻线对——液体段 S 高于空白玻璃段与水面背景段，借此自择正确段。
-    # 并排管液柱对齐，取各检出带结果的中位共用。
-    # ⚠️ 2026-10-13 训练修复（p1_0846 实战）：原"最长连续高饱和行段"会被水面
-    # 背景欺骗——水面 S 高且连续，液柱段误判为 923..2133 伸到画面底部，采样
-    # 全采到背景。水平线是玻璃管的结构特征（液面/管底），不受水面饱和度影响。
-    def _band_lines(gy, thr):
-        rows = np.where(gy > thr)[0]
-        if len(rows) == 0:
-            return []
-        clusters = []
-        for y in rows:
-            if clusters and y - clusters[-1][-1] <= 3:
-                clusters[-1].append(y)
-            else:
-                clusters.append([y])
-        return [int(np.mean(c)) for c in clusters]
-
-    ys_list = []
+    # 液柱段：检出带内 S>bg+0.08 的最长连续行段，取最宽者共用（并排管液柱对齐）
+    yband = None
     for a, b in bands:
-        band_v = hsv[:ytop, a + 15:b - 15, 2]
-        gy = np.abs(band_v[2:] - band_v[:-2]).mean(axis=1)
-        lines = _band_lines(gy, thr_line)
-        band_s = hsv[:ytop, a + 20:b - 20, 1]
-        row_s = np.median(band_s, axis=1)
-        best_pair = None
-        for i in range(len(lines) - 1):
-            y1, y2 = lines[i], lines[i + 1]
-            if not (40 < y2 - y1 < 0.6 * hh):
-                continue
-            seg_s = float(np.median(row_s[y1:y2]))
-            if best_pair is None or seg_s > best_pair[0]:
-                best_pair = (seg_s, y1, y2)
-        ys_list.append((best_pair[1], best_pair[2]) if best_pair else None)
-    valid_ys = [p for p in ys_list if p]
-    if valid_ys:
-        yband = (int(np.median([p[0] for p in valid_ys])),
-                 int(np.median([p[1] for p in valid_ys])))
-    else:
+        band = hsv[:, a + 20:b - 20, 1]
+        hot = np.median(band, axis=1) > bgS + 0.08
+        best, cur, start, bstart = 0, 0, 0, 0
+        for y, v in enumerate(hot):
+            if v:
+                if cur == 0:
+                    start = y
+                cur += 1
+                if cur > best:
+                    best, bstart = cur, start
+            else:
+                cur = 0
+        if best > 40 and (yband is None or best > yband[1] - yband[0]):
+            yband = (bstart, bstart + best)
+    if yband is None:
         yband = (int(hh * 0.30), int(hh * 0.60))     # 退化：图像中上部
 
     # 补齐到 expect 根（沿检出管左右按 P 推算；越界即止）
@@ -559,9 +534,8 @@ def auto_read_photo(fname, view="side"):
         out[p] = {"value": val, "warn": need_warn(p, val),
                   "hsv": None if r["hsv"] is None else tuple(np.round(r["hsv"], 3)),
                   "n": r["n"], "note": note, "box": box}
-        meta.append({"param": p, "cx": cx, "W": W, "y1": y1, "y2": y2,
-                     "detected": t["detected"], "transparent": r["transparent"],
-                     "box": box})
+        meta.append({"param": p, "cx": cx, "W": W, "detected": t["detected"],
+                     "transparent": r["transparent"], "box": box})
     return out, meta
 
 
@@ -661,7 +635,10 @@ TOP_PRIOR = 0.62        # 上方先验：只在前 62% 高度检测
 ANGLE_TOL = 12.0        # 垂直度容差（度），超出提示旋转重拍
 MODE_INNER = 0.16       # 整管选区两侧内缩比例（避管壁折射暗边）
 Y_PAD_TOP, Y_PAD_BOT = 6, 4   # 液柱段上下各避开的像素（液面线/管底）
-HUE_FAMILIES = {"pH": (0.25, 0.45, 0.15), "亚盐": (0.83, 0.97, 0.06), "氨氮": (0.10, 0.19, 0.25)}
+# pH族下界0.25→0.20：户外洗淡的绿管色相会漂到0.20-0.25(黄绿缝隙)，原下界0.25直接漏检。
+# 与氨氮族(0.05-0.19)留0.19-0.20缝隙不重叠。亚盐族不变。V>0.30(通道统一加)剔暗背景。
+# 注：户外绿背景与绿管色相重合属固有问题，颜色族仅作"候选+读数"用，指标最终以管序先验定。
+HUE_FAMILIES = {"pH": (0.20, 0.50, 0.15), "亚盐": (0.83, 0.97, 0.06), "氨氮": (0.05, 0.19, 0.25)}
 
 
 def load_rgb_safe(src):
@@ -688,9 +665,10 @@ def detect_tubes_v4(src, top_prior=TOP_PRIOR):
     ytop = int(hh * top_prior)
 
     # 通道1：色相族列投影 → 管带 + 液柱段
-    fam_bands = []
+    # 注：V>0.30 过滤暗背景/植被(如暗绿植被V≈0.10误入pH族)；同族相邻带合并(gap<60)防列投影波谷拆断同一根管。
+    fam_runs = {}
     for fam, (h1, h2, s_thr) in HUE_FAMILIES.items():
-        mask = (H[:ytop] >= h1) & (H[:ytop] <= h2) & (S[:ytop] > s_thr)
+        mask = (H[:ytop] >= h1) & (H[:ytop] <= h2) & (S[:ytop] > s_thr) & (V[:ytop] > 0.30)
         if mask.sum() < 3000:
             continue
         col = _smooth(mask.mean(axis=0), 9)
@@ -703,10 +681,26 @@ def detect_tubes_v4(src, top_prior=TOP_PRIOR):
                 runs.append((start, x)); inrun = False
         if inrun:
             runs.append((start, ww))
+        runs.sort()
+        merged = []
+        for a, b in runs:                      # 同族相邻带合并(被波谷拆断的同一根管)
+            if merged and a - merged[-1][1] < 60:
+                merged[-1] = (merged[-1][0], b)
+            else:
+                merged.append((a, b))
+        fam_runs[fam] = merged
+    fam_bands = []
+    for fam, runs in fam_runs.items():
+        mask = (H[:ytop] >= 0) & (H[:ytop] <= 1)  # 占位，下面按族重建
+        h1, h2, s_thr = HUE_FAMILIES[fam]
+        mask = (H[:ytop] >= h1) & (H[:ytop] <= h2) & (S[:ytop] > s_thr) & (V[:ytop] > 0.30)
         for a, b in runs:
             if not (60 < b - a < 800):
                 continue
-            hot = mask[:, a:b].mean(axis=1) > 0.4
+            # 液柱只在图像下半区(>0.30*ytop)找：剔除顶部天空/草地背景泛洪产生的假"液柱"，
+            # 真管液柱都在下方(本批照片 65%-94% 处)。背景误检带起点在顶部→直接落空被拒。
+            ylo = int(ytop * 0.30)
+            hot = mask[ylo:, a:b].mean(axis=1) > 0.4
             best, cur, start, bstart = 0, 0, 0, 0
             for y, v in enumerate(hot):
                 if v:
@@ -719,11 +713,22 @@ def detect_tubes_v4(src, top_prior=TOP_PRIOR):
                     cur = 0
             if best > 60:
                 fam_bands.append({"a": a, "b": b, "family": fam,
-                                  "y1": bstart, "y2": bstart + best, "h": best})
+                                  "y1": ylo + bstart, "y2": ylo + bstart + best, "h": best})
     # 族管液柱高度一致性（并排手持液柱对齐）
     if fam_bands:
         hm = float(np.median([t["h"] for t in fam_bands]))
         fam_bands = [t for t in fam_bands if abs(t["h"] - hm) <= 0.5 * hm]
+    # 去重：x 重叠的带保留液柱起点更靠下(更靠真管)者，剔除背景顶部误检
+    if fam_bands:
+        fam_bands.sort(key=lambda t: t["a"])
+        dd = []
+        for t in fam_bands:
+            if dd and t["a"] < dd[-1]["b"]:
+                if t["y1"] is not None and (dd[-1]["y1"] is None or t["y1"] > dd[-1]["y1"]):
+                    dd[-1] = t
+            else:
+                dd.append(t)
+        fam_bands = dd
 
     # 通道2：竖直边缘峰对 → 补近无色管
     Ex = np.abs(V[:, 2:] - V[:, :-2]); Ex = np.pad(Ex, ((0, 0), (1, 1)))
@@ -786,6 +791,36 @@ def detect_tubes_v4(src, top_prior=TOP_PRIOR):
         # 单侧管壁峰值低于常规阈值致峰对不完整→漏检。降阈值+放宽宽度容差补管，
         # 仍须过液面线验证；仅当管数不足3（比色卡固定3管）时触发，防误检。
         tubes += edge_bands(1.2, 0.60)
+
+    # 边缘管合并（修 10.13 18:34 东路镇图：左管被列投影/高光条拆成[286-556]+[556-659]两框）。
+    # 同色相族管不会到这步(族管已合并)；此处只合并"无色相、共享边或间距<30px、且合并宽<=1.6×族管宽"的相邻带，
+    # 即被拆断的同一根管。w_merge 上限防把两根真管并成一管（间距大的真管不会触发）。
+    none_t = [t for t in tubes if t["family"] is None]
+    if len(none_t) > 1:
+        none_t.sort(key=lambda t: t["a"])
+        merged = [dict(none_t[0])]
+        for t in none_t[1:]:
+            prev = merged[-1]
+            gap = t["a"] - prev["b"]
+            w_merge = t["b"] - prev["a"]
+            if gap < 30 and w_merge <= 1.6 * Wm:
+                merged[-1] = {"a": prev["a"], "b": t["b"], "family": None, "y1": None, "y2": None}
+            else:
+                merged.append(dict(t))
+        tubes = [t for t in tubes if t["family"] is not None] + merged
+
+    # 位置先验补 pH：标准手持卡左pH(绿)/中氨氮(黄)/右亚盐(粉)。若只检出氨氮+亚盐、
+    # 缺左pH(户外洗淡绿管色相漂移到青蓝/近白，颜色通道彻底失效)，在最左管左侧补一根同宽pH框，
+    # 标"位置推定·洗淡需复核"供人工核对。仅当恰好2管且为氨氮+亚盐时触发。
+    fams = [t.get("family") for t in tubes]
+    if len(tubes) == 2 and "氨氮" in fams and "亚盐" in fams:
+        left = min(tubes, key=lambda t: t["a"])
+        Wp = left["b"] - left["a"]
+        yp = (left["y1"], left["y2"]) if left["y1"] is not None else yseg
+        tubes.append({"a": max(0, left["a"] - Wp), "b": left["a"],
+                      "family": "pH", "y1": yp[0], "y2": yp[1], "h": None,
+                      "note": "位置推定·洗淡需复核"})
+        tubes.sort(key=lambda t: t["a"])
 
     # 液柱段：族管共用最宽者；边缘管共用
     yseg = None
@@ -867,33 +902,55 @@ STD_ORDER = ["pH", "氨氮", "亚盐"]   # 比色卡标准管序（左→右）�
 
 
 def _assign_params_by_order(results):
-    """近无色管指标推定：管序先验（左pH中氨氮右亚盐）。
+    """管序先验(左pH/中氨氮/右亚盐)推定指标。处理两类未定：
 
-    着色管已由色相定指标；近无色管无色相可依。规则：
-    - 未定指标管数 == 缺失指标数 == 1 → 唯一解，直接推定（无需管序）；
-    - 多个未定且共3管 → 按标准管序匹配，匹配不上再按剩余顺序填；
-    - 对不上（数量不符）→ 不猜，留空由人工复核。
+    ① 近无色管(色相=None)——旧逻辑：唯一解直接推定；
+    ② 偏色管(户外光把pH绿管色相漂到橙黄区，被误判为氨氮)——3管出现"1重复+1缺失"时，
+       按 STD_ORDER 位置把重复指标中对应位点改判为缺失指标（如左管误判氨氮→改回pH）。
+    拍照正常(各指标各1、无重复无缺失)时无歧义不触发；管序非标准(用户手持错序)不强行重排。
     """
+    # 旧逻辑：单张图内的近无色管
     unknown = [i for i, r in enumerate(results) if r["param"] is None]
     if not unknown:
+        pass
+    else:
+        taken = {r["param"] for r in results if r["param"]}
+        missing = [p for p in STD_ORDER if p not in taken]
+        if len(unknown) == 1 and len(missing) == 1:
+            results[unknown[0]]["param"] = missing[0]
+            results[unknown[0]]["note"] = (results[unknown[0]].get("note", "") + "；近无色按管序推定指标").lstrip("；")
+        elif len(results) == 3 and len(unknown) > 1 and len(unknown) == len(missing):
+            for i in unknown:
+                cand = STD_ORDER[i]
+                if cand in missing:
+                    results[i]["param"] = cand
+                    missing.remove(cand)
+            for i in unknown:
+                if results[i]["param"] is None and missing:
+                    results[i]["param"] = missing.pop(0)
+            for i in unknown:
+                results[i]["note"] = (results[i].get("note", "") + "；近无色按管序推定指标").lstrip("；")
+
+    # 偏色管重排：仅当恰好3管且"1指标重复 + 1指标缺失"时，按标准管序位置纠正
+    if len(results) != 3:
         return
-    taken = {r["param"] for r in results if r["param"]}
-    missing = [p for p in STD_ORDER if p not in taken]
-    if len(unknown) != len(missing):
-        return
-    if len(missing) == 1:
-        results[unknown[0]]["param"] = missing[0]
-    elif len(results) == 3:
-        for i in unknown:
-            cand = STD_ORDER[i]
-            if cand in missing:
-                results[i]["param"] = cand
-                missing.remove(cand)
-        for i in unknown:                      # 管序非标准的残余：按剩余顺序填
-            if results[i]["param"] is None and missing:
-                results[i]["param"] = missing.pop(0)
-    for i in unknown:                          # 推定过的打标，便于人工复核
-        results[i]["note"] = (results[i].get("note", "") + "；近无色按管序推定指标").lstrip("；")
+    counts = {}
+    for r in results:
+        p = r["param"]
+        counts[p] = counts.get(p, 0) + 1
+    dups = [p for p, c in counts.items() if c > 1]
+    miss = [p for p in STD_ORDER if counts.get(p, 0) == 0]
+    if len(dups) == 1 and len(miss) == 1 and dups[0] is not None:
+        r_idx, m = dups[0], miss[0]
+        k = STD_ORDER.index(m)              # 缺失指标的标准管序位置
+        if 0 <= k < 3 and results[k]["param"] == r_idx:
+            results[k]["param"] = m
+            hsv = results[k].get("hsv")     # 重排后按新指标重新读数
+            if hsv:
+                results[k]["value"], _ = hsv_to_value(m, hsv)
+            else:
+                results[k]["value"] = NO_COLOR.get(m)
+            results[k]["note"] = (results[k].get("note", "") + "；偏色按管序重排指标(原误判%s)" % r_idx).lstrip("；")
 
 
 def auto_read_photo_v4(fname, view="side"):
@@ -902,19 +959,21 @@ def auto_read_photo_v4(fname, view="side"):
     tubes, img, wbm = detect_tubes_v4(fname)
     results = []
     for t in tubes:
+        tnote = t.get("note", "")
         hsv_dom, st, pct = sample_liquid_mode(img, t)
         param = infer_param(hsv_dom, t)
         if hsv_dom is None:
             val = NO_COLOR.get(param) if param else None
             note = st + "；按低档读"
             results.append({"param": param, "value": val, "hsv": None,
-                            "note": note, "box": (t["a"], t["y1"], t["b"], t["y2"]),
+                            "note": (note + "；" + tnote).lstrip("；"),
+                            "box": (t["a"], t["y1"], t["b"], t["y2"]),
                             "angle": t["angle"], "vertical": t["vertical"]})
         else:
             val, vnote = hsv_to_value(param, hsv_dom)
             results.append({"param": param, "value": val,
                             "hsv": [float(hsv_dom[0]), float(hsv_dom[1]), float(hsv_dom[2])],
-                            "note": vnote + "；众数占%.0f%%" % pct,
+                            "note": (vnote + "；众数占%.0f%%" % pct + "；" + tnote).lstrip("；"),
                             "box": (t["a"], t["y1"], t["b"], t["y2"]),
                             "angle": t["angle"], "vertical": t["vertical"]})
     _assign_params_by_order(results)
